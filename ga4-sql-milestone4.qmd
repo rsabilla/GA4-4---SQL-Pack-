@@ -296,16 +296,23 @@ landing_pages AS (
     ORDER BY event_timestamp
   ) = 1
 ),
-session_purchases AS (
+purchase_events AS (
   SELECT
-    CONCAT(user_pseudo_id, '-', CAST(
-      (SELECT value.int_value FROM UNNEST(event_params)
-       WHERE key = 'ga_session_id') AS STRING)) AS session_key,
-    COUNT(*)                                    AS purchases,
-    SUM(IFNULL(ecommerce.purchase_revenue_in_usd, 0)) AS revenue_usd
+    user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params)
+     WHERE key = 'ga_session_id')            AS session_id,
+    IFNULL(ecommerce.purchase_revenue_in_usd, 0) AS revenue_usd
   FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
   WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
     AND event_name = 'purchase'
+),
+session_purchases AS (
+  SELECT
+    CONCAT(user_pseudo_id, '-', CAST(session_id AS STRING)) AS session_key,
+    COUNT(*)         AS purchases,
+    SUM(revenue_usd) AS revenue_usd
+  FROM purchase_events
+  WHERE session_id IS NOT NULL
   GROUP BY session_key
 )
 SELECT
@@ -327,7 +334,7 @@ LIMIT 15;
 ```
 
 - **This query answers:** For the most common entry pages, how often does a session that starts there end in a purchase, and how much revenue does each session bring in?
-- **It works by:** Building two separate session-level tables and joining them. `landing_pages` uses `ROW_NUMBER()` with `QUALIFY` to keep only the first page view in each session. `session_purchases` rolls purchases and revenue up to the session. The `LEFT JOIN` keeps **every** session, including the ones that didn't convert, so the conversion rate has the right denominator.
+- **It works by:** Building two separate session-level tables and joining them. `landing_pages` uses `ROW_NUMBER()` with `QUALIFY` to keep only the first page view in each session. `purchase_events` pulls each purchase with its session ID, and `session_purchases` rolls those up to one row per session. The `LEFT JOIN` keeps **every** session, including the ones that didn't convert, so the conversion rate has the right denominator.
 - **You'd use it when:** Deciding which landing pages to send paid or Ad Grants traffic to, or which ones need a redesign. This is the same type of session-level building block attribution work (Milestone 9) depends on.
 - **Caveat:** An `INNER JOIN` here would be a big mistake, since it would drop every non-converting session and push the conversion rate to 100%. Landing page is also defined as the first `page_view` by timestamp, which can differ slightly from GA4's built-in landing page dimension when events arrive out of order.
 
@@ -341,6 +348,6 @@ LIMIT 15;
 
 ## Appendix
 
-- **GitHub Repo:** <https://github.com/rsabilla/GA4-SQL-Milestone-4>
-- **GitHub Pages:** <https://rsabilla.github.io/GA4-SQL-Milestone-4/>
+- **GitHub Repo:** <https://github.com/rsabilla/GA4-4---SQL-Pack->
+- **GitHub Pages:** <https://rsabilla.github.io/GA4-4---SQL-Pack-/>
 - **Dataset:** [Google Analytics 4 public sample ecommerce dataset](https://developers.google.com/analytics/bigquery/web-ecommerce-demo-dataset)
