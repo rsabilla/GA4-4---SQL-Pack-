@@ -1,0 +1,346 @@
+---
+title: "Milestone 4: GoogleSQL on GA4 Export Data"
+subtitle: "Eight queries for filtering, aggregation, UNNEST, CTEs, and joins"
+author: "Ron Sabilla"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    number-sections: true
+    theme: cosmo
+    embed-resources: true
+    code-copy: true
+    highlight-style: github
+---
+
+## Overview
+
+For this milestone, I wrote eight BigQuery GoogleSQL queries on GA4 export data. The goal was to get comfortable with the core GA4 patterns (especially pulling values out of `event_params` with `UNNEST`) so I can actually contribute to the team's mart and analytics work later on.
+
+**Dataset:** `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+
+This is Google's public GA4 export from the Google Merchandise Store. It covers **Nov 1, 2020 – Jan 31, 2021**, with one table per day (`events_YYYYMMDD`). Every query below filters on `_TABLE_SUFFIX` so BigQuery only scans the days I actually need.
+
+### Skill coverage
+
+| # | Query | A. Filter | B. Group/Agg | C. UNNEST | D. CTE | E. Join/Combine |
+|---|---|:-:|:-:|:-:|:-:|:-:|
+| 1 | Purchase detail for one week | ✅ | | | | |
+| 2 | Event inventory | ✅ | ✅ | | | |
+| 3 | Daily KPI trend (users, sessions, revenue) | ✅ | ✅ | ✅ | | |
+| 4 | Revenue by device and country | ✅ | ✅ | | | |
+| 5 | Top pages by page views | ✅ | ✅ | ✅ | | |
+| 6 | Engagement time by page | ✅ | ✅ | ✅ | ✅ | |
+| 7 | Session-based ecommerce funnel | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 8 | Landing page conversion rate | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+### A few GA4 definitions I'm using throughout
+
+- **Events** = `COUNT(*)`. Every row in the export is one event.
+- **Users** = `COUNT(DISTINCT user_pseudo_id)`. This is a device/browser ID, so one person on two devices counts as two users.
+- **Sessions** = distinct `user_pseudo_id` + `ga_session_id`. The `ga_session_id` alone isn't unique across users, so I always combine the two into a `session_key`.
+- **Revenue** = `ecommerce.purchase_revenue_in_usd` on `purchase` events.
+
+## Query 1: Purchase Detail for One Week
+
+**Skills:** A (filtering and scoping)
+
+```sql
+-- Q1: Purchase-level detail for the first week of December 2020
+SELECT
+  PARSE_DATE('%Y%m%d', event_date)          AS event_date,
+  TIMESTAMP_MICROS(event_timestamp)         AS event_ts,
+  user_pseudo_id,
+  ecommerce.transaction_id,
+  ecommerce.purchase_revenue_in_usd         AS revenue_usd,
+  ecommerce.total_item_quantity             AS items,
+  device.category                           AS device_category,
+  geo.country
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201207'   -- only scan 7 daily tables
+  AND event_name = 'purchase'
+  AND ecommerce.purchase_revenue_in_usd > 0             -- drop $0 / test orders
+ORDER BY revenue_usd DESC
+LIMIT 50;
+```
+
+- **This query answers:** What do the biggest orders from the first week of December look like?
+- **It works by:** Limiting the scan to 7 daily tables with `_TABLE_SUFFIX`, keeping only `purchase` events with revenue above $0, and converting the raw date string and microsecond timestamp into readable formats.
+- **You'd use it when:** You want to sanity-check purchase data before building anything bigger, like spotting outlier orders or confirming that revenue and item counts are populating.
+- **Caveat:** `event_date` uses the property's time zone, but `event_timestamp` is in UTC, so an order late at night can land on a different day depending on which one you use. Also, this is the obfuscated sample, so some `transaction_id` values show up as `(not set)`.
+
+## Query 2: Event Inventory
+
+**Skills:** A (filtering), B (grouping and aggregation)
+
+```sql
+-- Q2: Which events fire, how often, and for how many users (Dec 1–7, 2020)
+SELECT
+  event_name,
+  COUNT(*)                                                AS event_count,
+  COUNT(DISTINCT user_pseudo_id)                          AS users,
+  ROUND(SAFE_DIVIDE(COUNT(*), COUNT(DISTINCT user_pseudo_id)), 2)
+                                                          AS events_per_user
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201207'
+GROUP BY event_name
+ORDER BY event_count DESC;
+```
+
+- **This query answers:** What events does this property collect, and how common is each one?
+- **It works by:** Grouping by `event_name` and calculating three things for each: total events (`COUNT(*)`), unique users (`COUNT(DISTINCT user_pseudo_id)`), and events per user.
+- **You'd use it when:** You're starting on a new GA4 property and need to know what's actually being tracked before writing more specific queries. It's also a quick way to see if a custom event (like a form submit) is firing at all.
+- **Caveat:** Event count and user count measure different things. `page_view` will have a huge event count since one user views many pages, while `purchase` has a much closer event-to-user ratio. Also, the user totals here can't be added up across rows, because the same user shows up under multiple events.
+
+## Query 3: Daily KPI Trend
+
+**Skills:** A (filtering), B (grouping and aggregation), C (UNNEST)
+
+```sql
+-- Q3: Daily users, sessions, page views, purchases, and revenue for November 2020
+SELECT
+  PARSE_DATE('%Y%m%d', event_date) AS date,
+  COUNT(DISTINCT user_pseudo_id)   AS users,
+  COUNT(DISTINCT CONCAT(
+    user_pseudo_id, '-',
+    CAST((SELECT value.int_value
+          FROM UNNEST(event_params)
+          WHERE key = 'ga_session_id') AS STRING)
+  ))                               AS sessions,
+  COUNTIF(event_name = 'page_view') AS page_views,
+  COUNTIF(event_name = 'purchase')  AS purchases,
+  ROUND(SUM(IF(event_name = 'purchase',
+               IFNULL(ecommerce.purchase_revenue_in_usd, 0), 0)), 2) AS revenue_usd
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201101' AND '20201130'
+GROUP BY date
+ORDER BY date;
+```
+
+- **This query answers:** How did traffic and sales trend day by day across November, including the Black Friday / Cyber Monday stretch?
+- **It works by:** Grouping by date and calculating several KPIs in one pass. `COUNTIF` counts specific events, and `SUM(IF(...))` adds up revenue only from purchases. For sessions, it pulls `ga_session_id` (an **integer**, so `int_value`) out of `event_params` and combines it with `user_pseudo_id` to get a unique session key.
+- **You'd use it when:** Building a daily trend chart or a base table for a dashboard. This is basically the starting point for the team's mart.
+- **Caveat:** Sessions that cross midnight get counted on both days, so adding up the daily sessions will slightly overcount the monthly total. A few events also have no `ga_session_id`, and those are left out of the session count because `CONCAT` returns NULL.
+
+## Query 4: Revenue by Device and Country
+
+**Skills:** A (filtering), B (grouping and aggregation)
+
+```sql
+-- Q4: Purchase performance by device category and country (December 2020)
+SELECT
+  device.category                                   AS device_category,
+  geo.country,
+  COUNT(DISTINCT user_pseudo_id)                    AS purchasers,
+  COUNT(*)                                          AS purchase_events,
+  ROUND(SUM(ecommerce.purchase_revenue_in_usd), 2)  AS revenue_usd,
+  ROUND(SAFE_DIVIDE(SUM(ecommerce.purchase_revenue_in_usd), COUNT(*)), 2)
+                                                    AS avg_order_value
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  AND event_name = 'purchase'
+GROUP BY device_category, geo.country
+HAVING COUNT(*) >= 10          -- ignore tiny segments with unstable averages
+ORDER BY revenue_usd DESC;
+```
+
+- **This query answers:** Which device and country combinations bring in the most revenue, and how does average order value compare across them?
+- **It works by:** Filtering to December purchases, grouping by two dimensions, then calculating purchasers, purchase events, total revenue, and AOV. `HAVING` removes groups with fewer than 10 purchases so a single big order doesn't skew the results.
+- **You'd use it when:** Deciding where to focus ad spend or optimization. For example, if mobile drives a lot of users but has a much lower AOV, that's worth looking into.
+- **Caveat:** `device` and `geo` come from the event itself, so if a user purchases on two different devices, they count as a purchaser in both rows. AOV here is revenue per purchase *event*, which assumes one purchase event per order.
+
+## Query 5: Top Pages by Page Views
+
+**Skills:** A (filtering), B (grouping and aggregation), C (UNNEST)
+
+```sql
+-- Q5: Most-viewed pages in December 2020 (explicit UNNEST join pattern)
+SELECT
+  REGEXP_REPLACE(ep.value.string_value, r'\?.*$', '') AS page_url,   -- strip query strings
+  COUNT(*)                                             AS page_views,
+  COUNT(DISTINCT e.user_pseudo_id)                     AS users
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*` AS e,
+  UNNEST(e.event_params) AS ep
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  AND e.event_name = 'page_view'
+  AND ep.key = 'page_location'        -- match the exact key we want
+GROUP BY page_url
+ORDER BY page_views DESC
+LIMIT 20;
+```
+
+- **This query answers:** What are the 20 most-viewed pages on the site in December?
+- **It works by:** Using the "flatten" version of `UNNEST`, where each event gets joined to its own parameters so every parameter becomes its own row. Filtering to `ep.key = 'page_location'` leaves exactly one row per page view. The URL is a **string**, so the value comes from `string_value`. `REGEXP_REPLACE` strips off anything after `?` so the same page with different tracking parameters gets grouped together.
+- **You'd use it when:** Figuring out which content gets the most attention, or picking pages to prioritize for SEO and site optimization.
+- **Caveat:** The `ep.key` filter matters a lot. Without it, every page view would get multiplied by the number of parameters on that event, which would inflate the counts several times over.
+
+## Query 6: Engagement Time by Page
+
+**Skills:** A (filtering), B (grouping and aggregation), C (UNNEST), D (CTE)
+
+```sql
+-- Q6: Which pages actually hold attention? (December 2020)
+WITH engagement AS (
+  SELECT
+    user_pseudo_id,
+    (SELECT value.string_value FROM UNNEST(event_params)
+     WHERE key = 'page_title')            AS page_title,
+    (SELECT value.int_value FROM UNNEST(event_params)
+     WHERE key = 'engagement_time_msec')  AS engagement_ms
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+    AND event_name = 'user_engagement'
+)
+SELECT
+  page_title,
+  COUNT(DISTINCT user_pseudo_id)                                   AS users,
+  ROUND(SUM(engagement_ms) / 1000 / 60, 1)                         AS total_engagement_min,
+  ROUND(SAFE_DIVIDE(SUM(engagement_ms) / 1000,
+                    COUNT(DISTINCT user_pseudo_id)), 1)            AS avg_engagement_sec_per_user
+FROM engagement
+WHERE engagement_ms IS NOT NULL
+GROUP BY page_title
+HAVING COUNT(DISTINCT user_pseudo_id) >= 100
+ORDER BY avg_engagement_sec_per_user DESC
+LIMIT 15;
+```
+
+- **This query answers:** On which pages do people actually spend time, not just land?
+- **It works by:** The CTE builds a clean event-level table first. It uses the "scalar subquery" version of `UNNEST` to grab `page_title` (a **string**) and `engagement_time_msec` (an **integer**, so `int_value`). The outer query then aggregates per page and converts milliseconds into minutes and seconds.
+- **You'd use it when:** Comparing page quality, not just traffic. A page with fewer views but high engagement might be worth promoting more.
+- **Caveat:** Picking the wrong value type is an easy mistake here. Reading `engagement_time_msec` from `string_value` would return all NULLs with no error. Also, `engagement_time_msec` isn't only sent on `user_engagement`, so this is a solid estimate but not the exact number the GA4 UI reports.
+
+## Query 7: Session-Based Ecommerce Funnel
+
+**Skills:** A, B, C, D (multiple CTEs), E (multi-step combining)
+
+```sql
+-- Q7: Session funnel: view_item → add_to_cart → begin_checkout → purchase (December 2020)
+WITH base_events AS (
+  SELECT
+    user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params)
+     WHERE key = 'ga_session_id') AS session_id,
+    event_name
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+    AND event_name IN ('session_start', 'view_item', 'add_to_cart',
+                       'begin_checkout', 'purchase')
+),
+session_flags AS (
+  -- one row per session, with a 1/0 flag for each funnel step
+  SELECT
+    CONCAT(user_pseudo_id, '-', CAST(session_id AS STRING)) AS session_key,
+    MAX(IF(event_name = 'view_item', 1, 0))      AS viewed_item,
+    MAX(IF(event_name = 'add_to_cart', 1, 0))    AS added_to_cart,
+    MAX(IF(event_name = 'begin_checkout', 1, 0)) AS began_checkout,
+    MAX(IF(event_name = 'purchase', 1, 0))       AS purchased
+  FROM base_events
+  WHERE session_id IS NOT NULL
+  GROUP BY session_key
+),
+funnel AS (
+  SELECT
+    COUNT(*)            AS sessions,
+    SUM(viewed_item)    AS view_item_sessions,
+    SUM(added_to_cart)  AS add_to_cart_sessions,
+    SUM(began_checkout) AS checkout_sessions,
+    SUM(purchased)      AS purchase_sessions
+  FROM session_flags
+)
+SELECT
+  *,
+  ROUND(100 * SAFE_DIVIDE(view_item_sessions,   sessions), 1)             AS pct_view_item,
+  ROUND(100 * SAFE_DIVIDE(add_to_cart_sessions, view_item_sessions), 1)   AS pct_view_to_cart,
+  ROUND(100 * SAFE_DIVIDE(checkout_sessions,    add_to_cart_sessions), 1) AS pct_cart_to_checkout,
+  ROUND(100 * SAFE_DIVIDE(purchase_sessions,    checkout_sessions), 1)    AS pct_checkout_to_purchase,
+  ROUND(100 * SAFE_DIVIDE(purchase_sessions,    sessions), 2)             AS session_conversion_rate
+FROM funnel;
+```
+
+- **This query answers:** Where do shoppers drop off between viewing a product and buying it?
+- **It works by:** It's built in three steps. `base_events` pulls only the five events I need along with the session ID. `session_flags` collapses each session into one row with a 1/0 flag for each step. `funnel` adds up those flags. The final `SELECT` then calculates step-to-step conversion rates. Splitting it up like this makes it easy for a teammate to change the steps or add a dimension like device.
+- **You'd use it when:** Finding the biggest leak in the purchase path, so the team knows whether to focus on product pages, the cart, or checkout.
+- **Caveat:** This is an **open** funnel. A session counts for a step if that event happened at any point, even out of order (like a purchase without a tracked `view_item`). For a strict sequential funnel, you'd need to compare `event_timestamp` between steps.
+
+## Query 8: Landing Page Conversion Rate
+
+**Skills:** A, B, C, D (CTEs), E (LEFT JOIN of two derived tables)
+
+```sql
+-- Q8: Which landing pages lead to purchases? (December 2020)
+WITH page_views AS (
+  SELECT
+    user_pseudo_id,
+    event_timestamp,
+    (SELECT value.int_value FROM UNNEST(event_params)
+     WHERE key = 'ga_session_id') AS session_id,
+    REGEXP_REPLACE(
+      (SELECT value.string_value FROM UNNEST(event_params)
+       WHERE key = 'page_location'), r'\?.*$', '') AS page_url
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+    AND event_name = 'page_view'
+),
+landing_pages AS (
+  -- first page_view in each session = landing page
+  SELECT
+    CONCAT(user_pseudo_id, '-', CAST(session_id AS STRING)) AS session_key,
+    page_url AS landing_page
+  FROM page_views
+  WHERE session_id IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY user_pseudo_id, session_id
+    ORDER BY event_timestamp
+  ) = 1
+),
+session_purchases AS (
+  SELECT
+    CONCAT(user_pseudo_id, '-', CAST(
+      (SELECT value.int_value FROM UNNEST(event_params)
+       WHERE key = 'ga_session_id') AS STRING)) AS session_key,
+    COUNT(*)                                    AS purchases,
+    SUM(IFNULL(ecommerce.purchase_revenue_in_usd, 0)) AS revenue_usd
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+    AND event_name = 'purchase'
+  GROUP BY session_key
+)
+SELECT
+  l.landing_page,
+  COUNT(*)                                           AS sessions,
+  COUNTIF(p.session_key IS NOT NULL)                 AS converting_sessions,
+  ROUND(100 * SAFE_DIVIDE(COUNTIF(p.session_key IS NOT NULL), COUNT(*)), 2)
+                                                     AS session_cvr_pct,
+  ROUND(IFNULL(SUM(p.revenue_usd), 0), 2)            AS revenue_usd,
+  ROUND(SAFE_DIVIDE(IFNULL(SUM(p.revenue_usd), 0), COUNT(*)), 2)
+                                                     AS revenue_per_session
+FROM landing_pages AS l
+LEFT JOIN session_purchases AS p
+  ON l.session_key = p.session_key
+GROUP BY l.landing_page
+HAVING COUNT(*) >= 500
+ORDER BY sessions DESC
+LIMIT 15;
+```
+
+- **This query answers:** For the most common entry pages, how often does a session that starts there end in a purchase, and how much revenue does each session bring in?
+- **It works by:** Building two separate session-level tables and joining them. `landing_pages` uses `ROW_NUMBER()` with `QUALIFY` to keep only the first page view in each session. `session_purchases` rolls purchases and revenue up to the session. The `LEFT JOIN` keeps **every** session, including the ones that didn't convert, so the conversion rate has the right denominator.
+- **You'd use it when:** Deciding which landing pages to send paid or Ad Grants traffic to, or which ones need a redesign. This is the same type of session-level building block attribution work (Milestone 9) depends on.
+- **Caveat:** An `INNER JOIN` here would be a big mistake, since it would drop every non-converting session and push the conversion rate to 100%. Landing page is also defined as the first `page_view` by timestamp, which can differ slightly from GA4's built-in landing page dimension when events arrive out of order.
+
+## Key Takeaways
+
+- **Always scope with `_TABLE_SUFFIX`.** It's the single biggest factor in query cost and speed with the daily `events_*` tables.
+- **Know your value types.** `page_location` and `page_title` are `string_value`. `ga_session_id` and `engagement_time_msec` are `int_value`. The wrong one silently returns NULL.
+- **Always match on `key`.** Both UNNEST styles (scalar subquery and the flatten join) only work correctly when they're filtered to the exact parameter key.
+- **Say what you're counting.** Events, users, and sessions are three different metrics, and mixing them up is the fastest way to report a misleading number.
+- **Use CTEs for anything multi-step.** Queries 6–8 are much easier to read, debug, and hand off to a teammate because each step has a clear name.
+
+## Appendix
+
+- **GitHub Repo:** <https://github.com/rsabilla/GA4-SQL-Milestone-4>
+- **GitHub Pages:** <https://rsabilla.github.io/GA4-SQL-Milestone-4/>
+- **Dataset:** [Google Analytics 4 public sample ecommerce dataset](https://developers.google.com/analytics/bigquery/web-ecommerce-demo-dataset)
